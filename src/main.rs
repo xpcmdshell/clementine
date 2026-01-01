@@ -5,7 +5,9 @@
     users of the admin dashboard.
 
     We can perform session fixation using these IDs to access the post-auth attack surface. Once logged in
-    as an admin, we can add a new
+    as an admin, we can add a new database connection, which opens up a few code execution paths via JDBC connectors:
+        - EL expression via logger output (drop a self-fixing webshell) - default method
+        - socketFactoryArg gadget chain: create a ProcessBuilder and launch `wget` to pull a webshell down (commented out)
 )
  */
 use clap::Parser;
