@@ -1,6 +1,6 @@
 /*
     Clementine exploits a vulnerability in the on-prem MiniOrange Identity Provider. Using the hardcoded
-    credentials (moadminidp:P@ssw0rd$987123) for the monitoring servlet, we can access a page that lists
+    credentials (moadminidp:P@ssw0rd$987123) for the monitoring servlet (JavaMelody), we can access a page that lists
     the names of cache keys used by Apache Shiro. The names of the keys match session IDs for logged in
     users of the admin dashboard.
 
@@ -8,6 +8,9 @@
     as an admin, we can add a new database connection, which opens up a few code execution paths via JDBC connectors:
         - EL expression via logger output (drop a self-fixing webshell) - default method
         - socketFactoryArg gadget chain: create a ProcessBuilder and launch `wget` to pull a webshell down (commented out)
+
+    Vulnerable Versions: 
+        Last tested on miniOrange 3.4
 )
  */
 use clap::Parser;
